@@ -397,6 +397,15 @@ class TestLegacyToolsetMap:
 # =========================================================================
 
 class TestVeraReadOnlyToolset:
+    def test_vera_read_only_reuses_a1_read_only_contract(self):
+        """MAT-527 B4: Vera must track the A1 read-only contract, not drift.
+
+        MAT-521 introduced the shared read-only schema. B4's Vera arm is only
+        review-ready if the profile-specific alias resolves to the same
+        contract as the generic read-only alias.
+        """
+        assert _READ_ONLY_TOOLSET_MAP["vera-read-only"] == _READ_ONLY_TOOLSET_MAP["read-only"]
+
     def test_vera_read_only_toolset_has_expected_read_tools(self, monkeypatch):
         """MAT-521 A1: Vera's named read-only toolset should expose useful
         inspection tools while keeping the tool schema non-mutating.
@@ -559,6 +568,40 @@ class TestVeraReadOnlyToolset:
 
 
 # =========================================================================
+# Profile aliases through saved tool config
+# =========================================================================
+
+class TestProfileToolConfigAliases:
+    def test_saved_platform_toolsets_preserve_authoritative_profile_aliases(self):
+        """MAT-527 B4: config must be able to select the profile aliases.
+
+        These aliases are intentionally not normal checklist entries, so the
+        platform tool config reader must pass them through to model_tools where
+        the authoritative allowlist lock is enforced.
+        """
+        from hermes_cli.tools_config import _get_platform_tools
+
+        config = {
+            "platform_toolsets": {
+                "cli": ["bob-profile", "steve-profile", "no_mcp"],
+                "telegram": ["vera-read-only", "no_mcp"],
+            },
+            "mcp_servers": {
+                "example": {"enabled": True},
+            },
+        }
+
+        cli_toolsets = _get_platform_tools(config, "cli")
+        telegram_toolsets = _get_platform_tools(config, "telegram")
+
+        assert "bob-profile" in cli_toolsets
+        assert "steve-profile" in cli_toolsets
+        assert "vera-read-only" in telegram_toolsets
+        assert "example" not in cli_toolsets
+        assert "example" not in telegram_toolsets
+
+
+# =========================================================================
 # Bob/Steve profile tool schemas
 # =========================================================================
 
@@ -640,6 +683,8 @@ class TestBobSteveProfileToolsets:
         assert set(_PROFILE_TOOLSET_MAP["steve-profile"]) == expected
 
         denied = {
+            # No dedicated push/PR/self-merge tools should be exposed to Steve.
+            "git_push", "create_pr", "merge_pr", "gh_pr_create", "github_pr_manage",
             "delegate_task", "clarify",
             "skill_manage",
             "web_extract",
