@@ -8,8 +8,11 @@ from model_tools import (
     handle_function_call,
     get_all_tool_names,
     get_toolset_for_tool,
+    get_tool_definitions,
     _AGENT_LOOP_TOOLS,
     _LEGACY_TOOLSET_MAP,
+    _READ_ONLY_TOOLSET_MAP,
+    _PROFILE_TOOLSET_MAP,
     TOOL_TO_TOOLSET_MAP,
 )
 
@@ -387,6 +390,334 @@ class TestLegacyToolsetMap:
             assert isinstance(tools, list), f"{name} is not a list"
             for tool in tools:
                 assert isinstance(tool, str), f"{name} contains non-string: {tool}"
+
+
+# =========================================================================
+# Vera read-only tool schema
+# =========================================================================
+
+class TestVeraReadOnlyToolset:
+    def test_vera_read_only_reuses_a1_read_only_contract(self):
+        """MAT-527 B4: Vera must track the A1 read-only contract, not drift.
+
+        MAT-521 introduced the shared read-only schema. B4's Vera arm is only
+        review-ready if the profile-specific alias resolves to the same
+        contract as the generic read-only alias.
+        """
+        assert _READ_ONLY_TOOLSET_MAP["vera-read-only"] == _READ_ONLY_TOOLSET_MAP["read-only"]
+
+    def test_vera_read_only_toolset_has_expected_read_tools(self, monkeypatch):
+        """MAT-521 A1: Vera's named read-only toolset should expose useful
+        inspection tools while keeping the tool schema non-mutating.
+        """
+        expected = {
+            "web_search",
+            "web_extract",
+            "read_file",
+            "search_files",
+            "vision_analyze",
+            "skills_list",
+            "skill_view",
+            "session_search",
+            "browser_navigate",
+            "browser_snapshot",
+            "browser_scroll",
+            "browser_back",
+            "browser_get_images",
+            "browser_vision",
+        }
+        assert set(_READ_ONLY_TOOLSET_MAP["vera-read-only"]) == expected
+
+        def fake_get_definitions(tool_names, quiet=False):
+            return [
+                {"type": "function", "function": {"name": name, "parameters": {}}}
+                for name in sorted(tool_names)
+            ]
+
+        monkeypatch.setattr("model_tools.registry.get_definitions", fake_get_definitions)
+        monkeypatch.setattr("tools.schema_sanitizer.sanitize_tool_schemas", lambda tools: tools)
+        monkeypatch.setattr("tools.tool_search.load_config", lambda: type("Cfg", (), {"enabled": "off"})())
+
+        tool_names = {
+            tool["function"]["name"]
+            for tool in get_tool_definitions(["vera-read-only"], quiet_mode=True)
+        }
+
+        assert expected <= tool_names
+
+    def test_vera_read_only_toolset_excludes_mutating_and_generation_tools(self, monkeypatch):
+        denied = {
+            "write_file",
+            "patch",
+            "terminal",
+            "process",
+            "execute_code",
+            "delegate_task",
+            "skill_manage",
+            "todo",
+            "memory",
+            "cronjob",
+            "send_message",
+            "image_generate",
+            "video_generate",
+            "text_to_speech",
+            "computer_use",
+            "browser_click",
+            "browser_type",
+            "browser_press",
+            "browser_console",
+            "browser_cdp",
+            "browser_dialog",
+            "ha_call_service",
+            "discord",
+            "discord_admin",
+            "feishu_drive_reply_comment",
+            "feishu_drive_add_comment",
+            "yb_send_dm",
+            "yb_send_sticker",
+        }
+        assert denied.isdisjoint(_READ_ONLY_TOOLSET_MAP["vera-read-only"])
+
+        def fake_get_definitions(tool_names, quiet=False):
+            return [
+                {"type": "function", "function": {"name": name, "parameters": {}}}
+                for name in sorted(tool_names)
+            ]
+
+        monkeypatch.setattr("model_tools.registry.get_definitions", fake_get_definitions)
+        monkeypatch.setattr("tools.schema_sanitizer.sanitize_tool_schemas", lambda tools: tools)
+        monkeypatch.setattr("tools.tool_search.load_config", lambda: type("Cfg", (), {"enabled": "off"})())
+
+        tool_names = {
+            tool["function"]["name"]
+            for tool in get_tool_definitions(["vera-read-only"], quiet_mode=True)
+        }
+
+        assert denied.isdisjoint(tool_names)
+
+        layered_tool_names = {
+            tool["function"]["name"]
+            for tool in get_tool_definitions(["vera-read-only", "hermes-cli"], quiet_mode=True)
+        }
+        assert denied.isdisjoint(layered_tool_names)
+        assert "read_file" in layered_tool_names
+
+    def test_vera_read_only_contrasts_with_mutating_hermes_cli(self, monkeypatch):
+        """MAT-521 A1: this regression must bite.
+
+        The broad hermes-cli composite intentionally exposes mutating file
+        tools, while vera-read-only must not. If Vera is pointed back at
+        hermes-cli, this test documents the exact regression vector.
+        """
+
+        def fake_get_definitions(tool_names, quiet=False):
+            return [
+                {"type": "function", "function": {"name": name, "parameters": {}}}
+                for name in sorted(tool_names)
+            ]
+
+        monkeypatch.setattr("model_tools.registry.get_definitions", fake_get_definitions)
+        monkeypatch.setattr("tools.schema_sanitizer.sanitize_tool_schemas", lambda tools: tools)
+        monkeypatch.setattr("tools.tool_search.load_config", lambda: type("Cfg", (), {"enabled": "off"})())
+
+        hermes_cli_tool_names = {
+            tool["function"]["name"]
+            for tool in get_tool_definitions(["hermes-cli"], quiet_mode=True)
+        }
+        vera_tool_names = {
+            tool["function"]["name"]
+            for tool in get_tool_definitions(["vera-read-only"], quiet_mode=True)
+        }
+        layered_tool_names = {
+            tool["function"]["name"]
+            for tool in get_tool_definitions(["vera-read-only", "hermes-cli"], quiet_mode=True)
+        }
+
+        assert "write_file" in hermes_cli_tool_names
+        assert "write_file" not in vera_tool_names
+        assert "write_file" not in layered_tool_names
+
+    def test_read_only_lock_does_not_neuter_non_read_only_toolsets(self, monkeypatch):
+        """The authoritative suppression is scoped to explicit read-only aliases.
+
+        Ordinary profiles that ask for file/hermes-cli without vera-read-only
+        still receive their normal tools.
+        """
+
+        def fake_get_definitions(tool_names, quiet=False):
+            return [
+                {"type": "function", "function": {"name": name, "parameters": {}}}
+                for name in sorted(tool_names)
+            ]
+
+        monkeypatch.setattr("model_tools.registry.get_definitions", fake_get_definitions)
+        monkeypatch.setattr("tools.schema_sanitizer.sanitize_tool_schemas", lambda tools: tools)
+        monkeypatch.setattr("tools.tool_search.load_config", lambda: type("Cfg", (), {"enabled": "off"})())
+
+        file_tool_names = {
+            tool["function"]["name"]
+            for tool in get_tool_definitions(["file"], quiet_mode=True)
+        }
+        hermes_cli_tool_names = {
+            tool["function"]["name"]
+            for tool in get_tool_definitions(["hermes-cli"], quiet_mode=True)
+        }
+
+        assert {"read_file", "search_files", "write_file", "patch"} <= file_tool_names
+        assert "write_file" in hermes_cli_tool_names
+
+
+# =========================================================================
+# Profile aliases through saved tool config
+# =========================================================================
+
+class TestProfileToolConfigAliases:
+    def test_saved_platform_toolsets_preserve_authoritative_profile_aliases(self):
+        """MAT-527 B4: config must be able to select the profile aliases.
+
+        These aliases are intentionally not normal checklist entries, so the
+        platform tool config reader must pass them through to model_tools where
+        the authoritative allowlist lock is enforced.
+        """
+        from hermes_cli.tools_config import _get_platform_tools
+
+        config = {
+            "platform_toolsets": {
+                "cli": ["bob-profile", "steve-profile", "no_mcp"],
+                "telegram": ["vera-read-only", "no_mcp"],
+            },
+            "mcp_servers": {
+                "example": {"enabled": True},
+            },
+        }
+
+        cli_toolsets = _get_platform_tools(config, "cli")
+        telegram_toolsets = _get_platform_tools(config, "telegram")
+
+        assert "bob-profile" in cli_toolsets
+        assert "steve-profile" in cli_toolsets
+        assert "vera-read-only" in telegram_toolsets
+        assert "example" not in cli_toolsets
+        assert "example" not in telegram_toolsets
+
+
+# =========================================================================
+# Bob/Steve profile tool schemas
+# =========================================================================
+
+class TestBobSteveProfileToolsets:
+    def _stub_schema_assembly(self, monkeypatch):
+        def fake_get_definitions(tool_names, quiet=False):
+            return [
+                {"type": "function", "function": {"name": name, "parameters": {}}}
+                for name in sorted(tool_names)
+            ]
+
+        monkeypatch.setattr("model_tools.registry.get_definitions", fake_get_definitions)
+        monkeypatch.setattr("tools.schema_sanitizer.sanitize_tool_schemas", lambda tools: tools)
+        monkeypatch.setattr("tools.tool_search.load_config", lambda: type("Cfg", (), {"enabled": "off"})())
+
+    def _tool_names_for(self, enabled_toolsets):
+        return {
+            tool["function"]["name"]
+            for tool in get_tool_definitions(enabled_toolsets, quiet_mode=True)
+        }
+
+    def test_profile_toolsets_reference_registered_tools(self):
+        """MAT-527 B4: profile aliases must use real registry tool names."""
+        registered = set(get_all_tool_names())
+        for profile_name, tool_names in _PROFILE_TOOLSET_MAP.items():
+            missing = set(tool_names) - registered
+            assert not missing, f"{profile_name} references unregistered tools: {sorted(missing)}"
+
+    def test_bob_profile_has_routing_read_only_and_comms_tools(self, monkeypatch):
+        """Bob is a routing/review/comms profile, not an implementation worker."""
+        expected = {
+            "delegate_task",
+            "web_search", "web_extract",
+            "read_file", "search_files",
+            "memory", "todo", "clarify",
+            "skills_list", "skill_view", "skill_manage",
+        }
+        assert set(_PROFILE_TOOLSET_MAP["bob-profile"]) == expected
+
+        denied = {
+            "write_file", "patch",
+            "terminal", "process", "execute_code",
+            "browser_navigate", "browser_snapshot", "browser_click",
+            "browser_type", "browser_scroll", "browser_back",
+            "browser_press", "browser_get_images", "browser_vision",
+            "browser_console", "browser_cdp", "browser_dialog",
+            "image_generate", "video_generate", "text_to_speech",
+            "cronjob", "send_message", "computer_use",
+            "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+            "discord", "discord_admin",
+            "feishu_drive_reply_comment", "feishu_drive_add_comment",
+            "yb_send_dm", "yb_send_sticker",
+        }
+        assert denied.isdisjoint(_PROFILE_TOOLSET_MAP["bob-profile"])
+
+        self._stub_schema_assembly(monkeypatch)
+        bob_tool_names = self._tool_names_for(["bob-profile"])
+        layered_tool_names = self._tool_names_for(["bob-profile", "hermes-cli"])
+
+        assert bob_tool_names == expected
+        assert layered_tool_names == expected
+        assert denied.isdisjoint(bob_tool_names)
+        assert denied.isdisjoint(layered_tool_names)
+
+    def test_steve_profile_has_implementation_tools_without_generators_or_routing(self, monkeypatch):
+        """Steve is an implementation/QA worker profile with no generators."""
+        expected = {
+            "read_file", "write_file", "patch", "search_files",
+            "terminal", "process",
+            "execute_code", "web_search",
+            # Read-only procedural recall for debugging and post-mortems.
+            "skills_list", "skill_view",
+            "browser_navigate", "browser_snapshot", "browser_click",
+            "browser_type", "browser_scroll", "browser_back",
+            "browser_press", "browser_get_images",
+            "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
+            "todo", "memory",
+        }
+        assert set(_PROFILE_TOOLSET_MAP["steve-profile"]) == expected
+
+        denied = {
+            # No dedicated push/PR/self-merge tools should be exposed to Steve.
+            "git_push", "create_pr", "merge_pr", "gh_pr_create", "github_pr_manage",
+            "delegate_task", "clarify",
+            "skill_manage",
+            "web_extract",
+            "image_generate", "video_generate", "text_to_speech",
+            "cronjob", "send_message", "computer_use",
+            "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+            "discord", "discord_admin",
+            "feishu_drive_reply_comment", "feishu_drive_add_comment",
+            "yb_send_dm", "yb_send_sticker",
+        }
+        assert denied.isdisjoint(_PROFILE_TOOLSET_MAP["steve-profile"])
+
+        self._stub_schema_assembly(monkeypatch)
+        steve_tool_names = self._tool_names_for(["steve-profile"])
+        layered_tool_names = self._tool_names_for(["steve-profile", "hermes-cli"])
+
+        assert steve_tool_names == expected
+        assert layered_tool_names == expected
+        assert denied.isdisjoint(steve_tool_names)
+        assert denied.isdisjoint(layered_tool_names)
+
+    def test_bob_and_steve_profiles_contrast_with_broad_hermes_cli(self, monkeypatch):
+        """Regression must bite if either profile falls back to hermes-cli."""
+        self._stub_schema_assembly(monkeypatch)
+
+        hermes_cli_tool_names = self._tool_names_for(["hermes-cli"])
+        bob_tool_names = self._tool_names_for(["bob-profile"])
+        steve_tool_names = self._tool_names_for(["steve-profile"])
+
+        assert {"write_file", "terminal", "image_generate", "text_to_speech"} <= hermes_cli_tool_names
+        assert {"write_file", "terminal", "image_generate", "text_to_speech"}.isdisjoint(bob_tool_names)
+        assert {"image_generate", "text_to_speech", "delegate_task", "clarify"}.isdisjoint(steve_tool_names)
+        assert {"write_file", "terminal", "execute_code"} <= steve_tool_names
 
 
 # =========================================================================
